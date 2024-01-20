@@ -8,7 +8,7 @@ use iroh_net::ticket::BlobTicket;
 
 // binary path
 fn sendme_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_sendme")
+    env!("CARGO_BIN_EXE_swarmie")
 }
 
 /// Read `n` lines from `reader`, returning the bytes read including the newlines.

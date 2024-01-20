@@ -16,15 +16,22 @@ use iroh_bytes::{
         fsm::{AtBlobHeaderNextError, DecodeError},
         request::get_hash_seq_and_sizes,
     },
+    protocol,
     provider::{self, handle_connection, EventSender},
     store::{ExportMode, ImportMode, ImportProgress},
     BlobFormat, Hash, HashAndFormat, TempTag,
 };
-use iroh_net::{key::SecretKey, ticket::BlobTicket, MagicEndpoint};
+use iroh_mainline_content_discovery::{
+    create_quinn_client,
+    protocol::{Announce, AnnounceKind, Query, QueryFlags},
+    query, query_dht, query_trackers, TrackerId,
+};
+use iroh_net::{config::Endpoint, key::SecretKey, ticket::BlobTicket, MagicEndpoint, NodeId};
 use rand::Rng;
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
+    net::{Ipv4Addr, SocketAddrV4},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -112,14 +119,22 @@ pub struct SendArgs {
     /// being shared.
     pub path: PathBuf,
 
+    /// Trackers to publish the data to. At least one is required.
+    #[clap(long)]
+    pub tracker: Vec<NodeId>,
+
     #[clap(flatten)]
     pub common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
 pub struct ReceiveArgs {
-    /// The ticket to use to connect to the sender.
-    pub ticket: BlobTicket,
+    /// The content to look up.
+    pub content: HashAndFormat,
+
+    /// Trackers to publish the data to. None are required.
+    #[clap(long)]
+    pub tracker: Vec<NodeId>,
 
     #[clap(flatten)]
     pub common: CommonArgs,
@@ -433,8 +448,11 @@ impl EventSender for ClientStatus {
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
+    let pkarr = pkarr::PkarrClient::new();
+    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::new(pkarr, Some(&secret_key));
     // create a magicsocket endpoint
     let endpoint_fut = MagicEndpoint::builder()
+        .discovery(Box::new(discovery))
         .alpns(vec![iroh_bytes::protocol::ALPN.to_vec()])
         .secret_key(secret_key)
         .bind(args.common.magic_port);
@@ -467,7 +485,12 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     }
     // make a ticket
     let addr = endpoint.my_addr().await?;
-    let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq)?;
+    let content = temp_tag.inner().clone();
+    let announce = Announce {
+        host: addr.node_id,
+        content: [content].into_iter().collect(),
+        kind: AnnounceKind::Complete,
+    };
     let entry_type = if path.is_file() { "file" } else { "directory" };
     println!(
         "imported {} {}, {}, hash {}",
@@ -476,13 +499,19 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         HumanBytes(size),
         print_hash(&hash, args.common.format)
     );
+    for tracker in args.tracker {
+        println!("announcing content {} to tracker {}", content, tracker);
+        let connection =
+            iroh_mainline_content_discovery::connect(&TrackerId::NodeId(tracker), 0).await?;
+        iroh_mainline_content_discovery::announce(connection, announce.clone()).await?;
+    }
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
         }
     }
     println!("to get this data, use");
-    println!("sendme receive {}", ticket);
+    println!("swarmie receive {}", content);
     let ps = SendStatus::new();
     let rt = LocalPoolHandle::new(1);
     loop {
@@ -617,41 +646,89 @@ fn show_get_error(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
-    let ticket = args.ticket;
-    let addr = ticket.node_addr().clone();
+async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
+    let content = args.content;
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
+    let pkarr = pkarr::PkarrClient::new();
+    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::new(pkarr, None);
     let endpoint = MagicEndpoint::builder()
         .alpns(vec![])
+        .discovery(Box::new(discovery))
         .secret_key(secret_key)
         .bind(args.common.magic_port)
         .await?;
-    let dir_name = format!(".sendme-get-{}", ticket.hash().to_hex());
+    let dir_name = format!(".sendme-get-{}", content.hash.to_hex());
     let iroh_data_dir = std::env::current_dir()?.join(dir_name);
     let db = iroh_bytes::store::flat::Store::load(&iroh_data_dir).await?;
     let mp = MultiProgress::new();
     let connect_progress = mp.add(ProgressBar::hidden());
     connect_progress.set_draw_target(ProgressDrawTarget::stderr());
     connect_progress.set_style(ProgressStyle::default_spinner());
-    connect_progress.set_message(format!("connecting to {}", addr.node_id));
-    let connection = endpoint.connect(addr, iroh_bytes::protocol::ALPN).await?;
-    let hash_and_format = HashAndFormat {
-        hash: ticket.hash(),
-        format: ticket.format(),
+    if args.tracker.is_empty() {
+        connect_progress.set_message(format!("connecting to mainline dht"));
+    } else {
+        connect_progress.set_message(format!("connecting to trackers"));
+    }
+    let q = Query {
+        content,
+        flags: QueryFlags {
+            complete: true,
+            verified: false,
+        },
     };
+    let candidates = if args.tracker.is_empty() {
+        let dht = mainline::Dht::default();
+        let endpoint = create_quinn_client(
+            std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            vec![iroh_mainline_content_discovery::protocol::TRACKER_ALPN.to_vec()],
+            false,
+        )?;
+        query_dht(endpoint, dht, q, 1)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|x| match x {
+                Ok(x) => Some(x),
+                Err(cause) => {
+                    println!("tracker error: {:?}", cause);
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        query_trackers(endpoint.clone(), args.tracker, q, 2)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|x| match x {
+                Ok(x) => Some(x),
+                Err(cause) => {
+                    println!("tracker error: {:?}", cause);
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    println!("found {:?} candidates", candidates);
+    let candidate = candidates
+        .into_iter()
+        .next()
+        .context("no candidates found")?;
+    let connection = endpoint
+        .connect_by_node_id(&candidate, iroh_bytes::protocol::ALPN)
+        .await?;
     connect_progress.finish_and_clear();
     let (send, recv) = flume::bounded(32);
     let progress = iroh_bytes::util::progress::FlumeProgressSender::new(send);
-    let (_hash_seq, sizes) =
-        get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32)
-            .await
-            .map_err(show_get_error)?;
+    let (_hash_seq, sizes) = get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
+        .await
+        .map_err(show_get_error)?;
     let total_size = sizes.iter().sum::<u64>();
     let total_files = sizes.len().saturating_sub(1);
     let payload_size = sizes.iter().skip(1).sum::<u64>();
     eprintln!(
         "getting collection {} {} files, {}",
-        print_hash(&ticket.hash(), args.common.format),
+        print_hash(&content.hash, args.common.format),
         total_files,
         HumanBytes(payload_size)
     );
@@ -664,10 +741,10 @@ async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
         );
     }
     let _task = tokio::spawn(show_download_progress(recv.into_stream(), total_size));
-    let stats = iroh_bytes::get::db::get_to_db(&db, connection, &hash_and_format, progress)
+    let stats = iroh_bytes::get::db::get_to_db(&db, connection, &content, progress)
         .await
         .map_err(show_get_error)?;
-    let collection = Collection::load(&db, &hash_and_format.hash).await?;
+    let collection = Collection::load(&db, &content.hash).await?;
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
@@ -712,7 +789,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let res = match args.command {
         Commands::Send(args) => send(args).await,
-        Commands::Receive(args) => get(args).await,
+        Commands::Receive(args) => receive(args).await,
     };
     match res {
         Ok(()) => std::process::exit(0),

@@ -1,6 +1,6 @@
 [package]
-name = "sendme"
-version = "0.2.3"
+name = "swarmie"
+version = "0.1.0"
 edition = "2021"
 authors = ["Rüdiger Klaehn <rklaehn@protonmail.com>", "n0 team"]
 keywords = ["scp", "sftp", "network", "p2p", "holepunching"]
@@ -29,6 +29,10 @@ tokio-util = "0.7.10"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 walkdir = "2.4.0"
+iroh-mainline-content-discovery = { path = "../iroh-examples/iroh-mainline-content-discovery", default-features = false }
+iroh-pkarr-node-discovery = "0.1.1"
+pkarr = "1.0.1"
+mainline = "1.0.0"
 
 [dev-dependencies]
 duct = "0.13.6"
