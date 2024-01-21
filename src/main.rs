@@ -90,10 +90,10 @@ fn print_hash(hash: &Hash, format: Format) -> String {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Send a file or directory.
-    Send(SendArgs),
+    Publish(PublishArgs),
 
     /// Receive a file or directory.
-    Receive(ReceiveArgs),
+    Subscribe(SubscribeArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -112,7 +112,7 @@ pub struct CommonArgs {
     pub verbose: u8,
 }
 #[derive(Parser, Debug)]
-pub struct SendArgs {
+pub struct PublishArgs {
     /// Path to the file or directory to send.
     ///
     /// The last component of the path will be used as the name of the data
@@ -128,7 +128,7 @@ pub struct SendArgs {
 }
 
 #[derive(Parser, Debug)]
-pub struct ReceiveArgs {
+pub struct SubscribeArgs {
     /// The content to look up.
     pub content: HashAndFormat,
 
@@ -446,7 +446,7 @@ impl EventSender for ClientStatus {
     }
 }
 
-async fn send(args: SendArgs) -> anyhow::Result<()> {
+async fn send(args: PublishArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
     let pkarr = pkarr::PkarrClient::new();
     let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::new(pkarr, Some(&secret_key));
@@ -459,7 +459,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     // use a flat store - todo: use a partial in mem store instead
     let suffix = rand::thread_rng().gen::<[u8; 16]>();
     let iroh_data_dir =
-        std::env::current_dir()?.join(format!(".sendme-send-{}", hex::encode(suffix)));
+        std::env::current_dir()?.join(format!(".swarmie-send-{}", hex::encode(suffix)));
     if iroh_data_dir.exists() {
         println!("can not share twice from the same directory");
         std::process::exit(1);
@@ -646,7 +646,7 @@ fn show_get_error(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
+async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
     let content = args.content;
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
     let pkarr = pkarr::PkarrClient::new();
@@ -657,7 +657,7 @@ async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
         .secret_key(secret_key)
         .bind(args.common.magic_port)
         .await?;
-    let dir_name = format!(".sendme-get-{}", content.hash.to_hex());
+    let dir_name = format!(".swarmie-get-{}", content.hash.to_hex());
     let iroh_data_dir = std::env::current_dir()?.join(dir_name);
     let db = iroh_bytes::store::flat::Store::load(&iroh_data_dir).await?;
     let mp = MultiProgress::new();
@@ -788,8 +788,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let res = match args.command {
-        Commands::Send(args) => send(args).await,
-        Commands::Receive(args) => receive(args).await,
+        Commands::Publish(args) => send(args).await,
+        Commands::Subscribe(args) => receive(args).await,
     };
     match res {
         Ok(()) => std::process::exit(0),

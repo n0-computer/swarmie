@@ -1,23 +1,20 @@
-# Sendme
+# Swarmie
 
-This is an example to use [iroh-bytes](https://crates.io/crates/iroh-bytes) and
-[iroh-net](https://crates.io/crates/iroh-net) to send files and directories over
-the internet.
+This is a proof of concept tool to use iroh global content discovery using the
+bittorrent mainline DHT.
 
-It is also useful as a standalone tool for quick copy jobs.
+It is basically [sendme](https://github.com/n0-computer/sendme) but with an
+additional step of publishing to a tracker.
 
-Iroh-net will take case of hole punching and NAT traversal whenever possible, and
-fall back to a relay if hole punching does not succeed.
+**WARNING**
 
-Iroh-bytes will take care of [blake3](https://crates.io/crates/blake3) verified streaming, including resuming interrupted downloads.
-
-Sendme works with 256 bit node ids and therefore location transparent. A ticket will
-remain valid if the IP address changes. Connections are encrypted using TLS.
+While dumbpipe and sendme are reasonably well tested and can be used in production,
+this one is currently _very_ experimental...
 
 # Installation
 
 ```
-cargo install sendme
+cargo install swarmie
 ```
 
 # Usage
@@ -25,11 +22,11 @@ cargo install sendme
 ## Send side
 
 ```
-sendme provide <file or directory>
+swarmie publish <file or directory>
 ```
 
 This will create a temporary iroh node that serves the content in the given file or directory.
-It will output a ticket that can be used to get the data.
+It will publish information about the data to one or more trackers.
 
 The provider will run until it is terminated using Control-C. On termination it will delete
 the temporary directory.
@@ -40,8 +37,12 @@ won't be needed anymore.
 ### Receive side
 
 ```
-sendme get <ticket>
+swarmie subscribe <hash>
 ```
+
+When given trackers as arguments, this will connect to all trackers and ask them
+if they know who has the content. If no tracker arguments are provided, it will
+query the bittorrent mainline DHT for trackers.
 
 This will download the data and create a file or directory named like the source
 in the **current directory**.
@@ -51,4 +52,4 @@ file or directory), and only then move these files to the target directory.
 
 On completion it will delete the temp directory.
 
-All temp directories start with `.sendme-`.
+All temp directories start with `.swarmie-`.
