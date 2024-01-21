@@ -16,7 +16,6 @@ use iroh_bytes::{
         fsm::{AtBlobHeaderNextError, DecodeError},
         request::get_hash_seq_and_sizes,
     },
-    protocol,
     provider::{self, handle_connection, EventSender},
     store::{ExportMode, ImportMode, ImportProgress},
     BlobFormat, Hash, HashAndFormat, TempTag,
@@ -24,9 +23,9 @@ use iroh_bytes::{
 use iroh_mainline_content_discovery::{
     create_quinn_client,
     protocol::{Announce, AnnounceKind, Query, QueryFlags},
-    query, query_dht, query_trackers, TrackerId,
+    query_dht, query_trackers, TrackerId,
 };
-use iroh_net::{config::Endpoint, key::SecretKey, ticket::BlobTicket, MagicEndpoint, NodeId};
+use iroh_net::{key::SecretKey, MagicEndpoint, NodeId};
 use rand::Rng;
 use std::{
     collections::BTreeMap,
@@ -446,10 +445,9 @@ impl EventSender for ClientStatus {
     }
 }
 
-async fn send(args: PublishArgs) -> anyhow::Result<()> {
+async fn publish(args: PublishArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let pkarr = pkarr::PkarrClient::new();
-    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::new(pkarr, Some(&secret_key));
+    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder().secret_key(&secret_key).build();
     // create a magicsocket endpoint
     let endpoint_fut = MagicEndpoint::builder()
         .discovery(Box::new(discovery))
@@ -505,13 +503,15 @@ async fn send(args: PublishArgs) -> anyhow::Result<()> {
             iroh_mainline_content_discovery::connect(&TrackerId::NodeId(tracker), 0).await?;
         iroh_mainline_content_discovery::announce(connection, announce.clone()).await?;
     }
+    println!("our node id is {}", addr.node_id);
+    println!("our pkarr id is {}", pkarr::PublicKey::try_from(*addr.node_id.as_bytes())?.to_z32());
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
         }
     }
     println!("to get this data, use");
-    println!("swarmie receive {}", content);
+    println!("swarmie subscribe {}", content);
     let ps = SendStatus::new();
     let rt = LocalPoolHandle::new(1);
     loop {
@@ -649,8 +649,7 @@ fn show_get_error(e: anyhow::Error) -> anyhow::Error {
 async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
     let content = args.content;
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let pkarr = pkarr::PkarrClient::new();
-    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::new(pkarr, None);
+    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::default();
     let endpoint = MagicEndpoint::builder()
         .alpns(vec![])
         .discovery(Box::new(discovery))
@@ -680,7 +679,7 @@ async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
         let dht = mainline::Dht::default();
         let endpoint = create_quinn_client(
             std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            vec![iroh_mainline_content_discovery::protocol::TRACKER_ALPN.to_vec()],
+            vec![iroh_mainline_content_discovery::protocol::ALPN.to_vec()],
             false,
         )?;
         query_dht(endpoint, dht, q, 1)
@@ -709,11 +708,12 @@ async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>()
     };
-    println!("found {:?} candidates", candidates);
+    println!("found {} candidates", candidates.len());
     let candidate = candidates
         .into_iter()
         .next()
         .context("no candidates found")?;
+    println!("trying candidate {}", candidate);
     let connection = endpoint
         .connect_by_node_id(&candidate, iroh_bytes::protocol::ALPN)
         .await?;
@@ -788,7 +788,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let res = match args.command {
-        Commands::Publish(args) => send(args).await,
+        Commands::Publish(args) => publish(args).await,
         Commands::Subscribe(args) => receive(args).await,
     };
     match res {

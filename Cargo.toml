@@ -29,8 +29,8 @@ tokio-util = "0.7.10"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 walkdir = "2.4.0"
-iroh-mainline-content-discovery = { path = "../iroh-examples/iroh-mainline-content-discovery", default-features = false }
-iroh-pkarr-node-discovery = "0.1.1"
+iroh-mainline-content-discovery = { version = "0.3.0", features = ["client"], default-features = false }
+iroh-pkarr-node-discovery = "0.1.2"
 pkarr = "1.0.1"
 mainline = "1.0.0"
 
