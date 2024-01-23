@@ -22,7 +22,7 @@ use iroh_bytes::{
 };
 use iroh_mainline_content_discovery::{
     create_quinn_client,
-    protocol::{Announce, AnnounceKind, Query, QueryFlags},
+    protocol::{AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce},
     query_dht, query_trackers, TrackerId,
 };
 use iroh_net::{key::SecretKey, MagicEndpoint, NodeId};
@@ -447,12 +447,14 @@ impl EventSender for ClientStatus {
 
 async fn publish(args: PublishArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
-    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder().secret_key(&secret_key).build();
+    let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder()
+        .secret_key(&secret_key)
+        .build();
     // create a magicsocket endpoint
     let endpoint_fut = MagicEndpoint::builder()
         .discovery(Box::new(discovery))
         .alpns(vec![iroh_bytes::protocol::ALPN.to_vec()])
-        .secret_key(secret_key)
+        .secret_key(secret_key.clone())
         .bind(args.common.magic_port);
     // use a flat store - todo: use a partial in mem store instead
     let suffix = rand::thread_rng().gen::<[u8; 16]>();
@@ -486,9 +488,11 @@ async fn publish(args: PublishArgs) -> anyhow::Result<()> {
     let content = temp_tag.inner().clone();
     let announce = Announce {
         host: addr.node_id,
-        content: [content].into_iter().collect(),
+        content,
         kind: AnnounceKind::Complete,
+        timestamp: AbsoluteTime::now(),
     };
+    let signed_announce = SignedAnnounce::new(announce, &secret_key)?;
     let entry_type = if path.is_file() { "file" } else { "directory" };
     println!(
         "imported {} {}, {}, hash {}",
@@ -501,10 +505,13 @@ async fn publish(args: PublishArgs) -> anyhow::Result<()> {
         println!("announcing content {} to tracker {}", content, tracker);
         let connection =
             iroh_mainline_content_discovery::connect(&TrackerId::NodeId(tracker), 0).await?;
-        iroh_mainline_content_discovery::announce(connection, announce.clone()).await?;
+        iroh_mainline_content_discovery::announce(connection, signed_announce.clone()).await?;
     }
     println!("our node id is {}", addr.node_id);
-    println!("our pkarr id is {}", pkarr::PublicKey::try_from(*addr.node_id.as_bytes())?.to_z32());
+    println!(
+        "our pkarr id is {}",
+        pkarr::PublicKey::try_from(*addr.node_id.as_bytes())?.to_z32()
+    );
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
@@ -713,9 +720,9 @@ async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
         .into_iter()
         .next()
         .context("no candidates found")?;
-    println!("trying candidate {}", candidate);
+    println!("trying announce {:?}", candidate);
     let connection = endpoint
-        .connect_by_node_id(&candidate, iroh_bytes::protocol::ALPN)
+        .connect_by_node_id(&candidate.host, iroh_bytes::protocol::ALPN)
         .await?;
     connect_progress.finish_and_clear();
     let (send, recv) = flume::bounded(32);
