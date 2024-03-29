@@ -22,7 +22,7 @@ indicatif = "0.17.7"
 iroh-base = "0.13"
 iroh-bytes = "0.13"
 iroh-io = "0.4.0"
-iroh-mainline-content-discovery = { path = "../iroh-examples/content-discovery/iroh-mainline-content-discovery" }
+iroh-mainline-content-discovery = "0.5.0"
 iroh-net = "0.13"
 iroh-pkarr-node-discovery = "0.2.0"
 mainline = "1.4.0"

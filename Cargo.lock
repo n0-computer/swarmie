@@ -1726,6 +1726,8 @@ dependencies = [
 [[package]]
 name = "iroh-mainline-content-discovery"
 version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e80b59a72c6f5c763f4c4cbdef2a9a412981b8d5c24074708eca237d3603f0d3"
 dependencies = [
  "anyhow",
  "derive_more",

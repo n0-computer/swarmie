@@ -21,7 +21,7 @@ use iroh_bytes::{
     BlobFormat, Hash, HashAndFormat, TempTag,
 };
 use iroh_mainline_content_discovery::protocol::{
-    AbsoluteTime, Announce, AnnounceKind, SignedAnnounce,
+    AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce,
 };
 use iroh_net::{key::SecretKey, MagicEndpoint};
 use rand::Rng;
@@ -660,16 +660,37 @@ async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
         SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
     ))
     .await?;
-    let query = iroh_mainline_content_discovery::protocol::Query {
+    let query = Query {
         content,
-        flags: iroh_mainline_content_discovery::protocol::QueryFlags {
+        flags: QueryFlags {
             complete: true,
             verified: true,
         },
     };
-    println!("query {:?}", query);
-    let mut stream = udp_discovery.query_dht(dht, query).await?;
-    let Some(announce) = stream.next().await else {
+    tracing::info!("query {:?}", query);
+    let stream = udp_discovery.query_dht(dht, query).await?;
+    let connections = stream
+        .map(move |announce| {
+            tracing::info!("got announce {:?}", announce);
+            let endpoint = endpoint.clone();
+            async move {
+                endpoint
+                    .connect_by_node_id(&announce.host, iroh_bytes::protocol::ALPN)
+                    .await
+            }
+        })
+        .buffer_unordered(4)
+        .filter_map(|x| async {
+            match x {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    eprintln!("error connecting to node: {:?}", e);
+                    None
+                }
+            }
+        });
+    tokio::pin!(connections);
+    let Some(connection) = connections.next().await else {
         eprintln!("no announce found");
         std::process::exit(1);
     };
@@ -680,17 +701,12 @@ async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
     let connect_progress = mp.add(ProgressBar::hidden());
     connect_progress.set_draw_target(ProgressDrawTarget::stderr());
     connect_progress.set_style(ProgressStyle::default_spinner());
-    connect_progress.set_message(format!("connecting to {}", announce.host));
-    let connection = endpoint
-        .connect_by_node_id(&announce.host, iroh_bytes::protocol::ALPN)
-        .await?;
     connect_progress.finish_and_clear();
     let (send, recv) = flume::bounded(32);
     let progress = iroh_bytes::util::progress::FlumeProgressSender::new(send);
-    let (_hash_seq, sizes) =
-        get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
-            .await
-            .map_err(show_get_error)?;
+    let (_hash_seq, sizes) = get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
+        .await
+        .map_err(show_get_error)?;
     let total_size = sizes.iter().sum::<u64>();
     let total_files = sizes.len().saturating_sub(1);
     let payload_size = sizes.iter().skip(1).sum::<u64>();
