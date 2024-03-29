@@ -20,17 +20,15 @@ use iroh_bytes::{
     store::{ExportMode, ImportMode, ImportProgress},
     BlobFormat, Hash, HashAndFormat, TempTag,
 };
-use iroh_mainline_content_discovery::{
-    create_quinn_client,
-    protocol::{AbsoluteTime, Announce, AnnounceKind, Query, QueryFlags, SignedAnnounce},
-    query_dht, query_trackers, TrackerId,
+use iroh_mainline_content_discovery::protocol::{
+    AbsoluteTime, Announce, AnnounceKind, SignedAnnounce,
 };
-use iroh_net::{key::SecretKey, MagicEndpoint, NodeId};
+use iroh_net::{key::SecretKey, MagicEndpoint};
 use rand::Rng;
 use std::{
     collections::BTreeMap,
     fmt::{Display, Formatter},
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -89,10 +87,10 @@ fn print_hash(hash: &Hash, format: Format) -> String {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Send a file or directory.
-    Publish(PublishArgs),
+    Send(SendArgs),
 
     /// Receive a file or directory.
-    Subscribe(SubscribeArgs),
+    Receive(ReceiveArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -111,29 +109,25 @@ pub struct CommonArgs {
     pub verbose: u8,
 }
 #[derive(Parser, Debug)]
-pub struct PublishArgs {
+pub struct SendArgs {
     /// Path to the file or directory to send.
     ///
     /// The last component of the path will be used as the name of the data
     /// being shared.
     pub path: PathBuf,
 
-    /// Trackers to publish the data to. At least one is required.
+    /// Trackers to announce the data to.
     #[clap(long)]
-    pub tracker: Vec<NodeId>,
+    pub tracker: Vec<SocketAddr>,
 
     #[clap(flatten)]
     pub common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
-pub struct SubscribeArgs {
-    /// The content to look up.
+pub struct ReceiveArgs {
+    /// The ticket to use to connect to the sender.
     pub content: HashAndFormat,
-
-    /// Trackers to publish the data to. None are required.
-    #[clap(long)]
-    pub tracker: Vec<NodeId>,
 
     #[clap(flatten)]
     pub common: CommonArgs,
@@ -301,7 +295,7 @@ async fn import(
     let progress = iroh_bytes::util::progress::FlumeProgressSender::new(send);
     let show_progress = tokio::spawn(show_ingest_progress(recv.into_stream()));
     // import all the files, using num_cpus workers, return names and temp tags
-    let names_and_tags = futures::stream::iter(data_sources)
+    let mut names_and_tags = futures::stream::iter(data_sources)
         .map(|(name, path)| {
             let db = db.clone();
             let progress = progress.clone();
@@ -318,6 +312,7 @@ async fn import(
         .into_iter()
         .collect::<anyhow::Result<Vec<_>>>()?;
     drop(progress);
+    names_and_tags.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
     // total size of all files
     let size = names_and_tags.iter().map(|(_, _, size)| *size).sum::<u64>();
     // collect the (name, hash) tuples into a collection
@@ -356,8 +351,13 @@ async fn export(db: impl iroh_bytes::store::Store, collection: Collection) -> an
             eprintln!("You can remove the file or directory and try again. The download will not be repeated.");
             anyhow::bail!("target {} already exists", target.display());
         }
-        db.export(*hash, target, ExportMode::TryReference, |_position| Ok(()))
-            .await?;
+        db.export(
+            *hash,
+            target,
+            ExportMode::TryReference,
+            Box::new(move |_position| Ok(())),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -445,16 +445,16 @@ impl EventSender for ClientStatus {
     }
 }
 
-async fn publish(args: PublishArgs) -> anyhow::Result<()> {
+async fn send(args: SendArgs) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
     let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::builder()
         .secret_key(&secret_key)
         .build();
     // create a magicsocket endpoint
     let endpoint_fut = MagicEndpoint::builder()
-        .discovery(Box::new(discovery))
         .alpns(vec![iroh_bytes::protocol::ALPN.to_vec()])
         .secret_key(secret_key.clone())
+        .discovery(Box::new(discovery))
         .bind(args.common.magic_port);
     // use a flat store - todo: use a partial in mem store instead
     let suffix = rand::thread_rng().gen::<[u8; 16]>();
@@ -473,19 +473,19 @@ async fn publish(args: PublishArgs) -> anyhow::Result<()> {
         anyhow::Ok(())
     });
     std::fs::create_dir_all(&iroh_data_dir)?;
-    let db = iroh_bytes::store::flat::Store::load(&iroh_data_dir).await?;
+    let db = iroh_bytes::store::fs::Store::load(&iroh_data_dir).await?;
     let path = args.path;
     let (temp_tag, size, collection) = import(path.clone(), db.clone()).await?;
     let hash = *temp_tag.hash();
     // wait for the endpoint to be ready
     let endpoint = endpoint_fut.await?;
     // wait for the endpoint to figure out its address before making a ticket
-    while endpoint.my_derp().is_none() {
+    while endpoint.my_relay().is_none() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     // make a ticket
     let addr = endpoint.my_addr().await?;
-    let content = temp_tag.inner().clone();
+    let content = *temp_tag.inner();
     let announce = Announce {
         host: addr.node_id,
         content,
@@ -493,6 +493,15 @@ async fn publish(args: PublishArgs) -> anyhow::Result<()> {
         timestamp: AbsoluteTime::now(),
     };
     let signed_announce = SignedAnnounce::new(announce, &secret_key)?;
+    let udp_discovery = iroh_mainline_content_discovery::UdpDiscovery::new(SocketAddr::V4(
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    ))
+    .await?;
+    for tracker in args.tracker {
+        println!("announcing content {} to tracker {}", content, tracker);
+        udp_discovery.add_tracker(tracker).await?;
+    }
+    udp_discovery.announce(signed_announce).await?;
     let entry_type = if path.is_file() { "file" } else { "directory" };
     println!(
         "imported {} {}, {}, hash {}",
@@ -501,24 +510,13 @@ async fn publish(args: PublishArgs) -> anyhow::Result<()> {
         HumanBytes(size),
         print_hash(&hash, args.common.format)
     );
-    for tracker in args.tracker {
-        println!("announcing content {} to tracker {}", content, tracker);
-        let connection =
-            iroh_mainline_content_discovery::connect(&TrackerId::NodeId(tracker), 0).await?;
-        iroh_mainline_content_discovery::announce(connection, signed_announce.clone()).await?;
-    }
-    println!("our node id is {}", addr.node_id);
-    println!(
-        "our pkarr id is {}",
-        pkarr::PublicKey::try_from(*addr.node_id.as_bytes())?.to_z32()
-    );
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
             println!("    {} {name}", print_hash(hash, args.common.format));
         }
     }
     println!("to get this data, use");
-    println!("swarmie subscribe {}", content);
+    println!("swarmie receive {}", content);
     let ps = SendStatus::new();
     let rt = LocalPoolHandle::new(1);
     loop {
@@ -582,20 +580,14 @@ pub async fn show_download_progress(
             DownloadProgress::Done { id } => {
                 total_done += sizes.remove(&id).unwrap_or_default();
             }
-            DownloadProgress::NetworkDone {
-                bytes_read,
-                elapsed,
-                ..
-            } => {
+            DownloadProgress::AllDone(stats) => {
                 op.finish_and_clear();
                 eprintln!(
                     "Transferred {} in {}, {}/s",
-                    HumanBytes(bytes_read),
-                    HumanDuration(elapsed),
-                    HumanBytes((bytes_read as f64 / elapsed.as_secs_f64()) as u64)
+                    HumanBytes(stats.bytes_read),
+                    HumanDuration(stats.elapsed),
+                    HumanBytes((stats.bytes_read as f64 / stats.elapsed.as_secs_f64()) as u64)
                 );
-            }
-            DownloadProgress::AllDone => {
                 break;
             }
             DownloadProgress::Abort(e) => {
@@ -653,83 +645,52 @@ fn show_get_error(e: anyhow::Error) -> anyhow::Error {
     e
 }
 
-async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
+async fn get(args: ReceiveArgs) -> anyhow::Result<()> {
+    let dht = mainline::Dht::default();
     let content = args.content;
     let secret_key = get_or_create_secret(args.common.verbose > 0)?;
     let discovery = iroh_pkarr_node_discovery::PkarrNodeDiscovery::default();
     let endpoint = MagicEndpoint::builder()
         .alpns(vec![])
-        .discovery(Box::new(discovery))
         .secret_key(secret_key)
+        .discovery(Box::new(discovery))
         .bind(args.common.magic_port)
         .await?;
+    let udp_discovery = iroh_mainline_content_discovery::UdpDiscovery::new(SocketAddr::V4(
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    ))
+    .await?;
+    let query = iroh_mainline_content_discovery::protocol::Query {
+        content,
+        flags: iroh_mainline_content_discovery::protocol::QueryFlags {
+            complete: true,
+            verified: true,
+        },
+    };
+    println!("query {:?}", query);
+    let mut stream = udp_discovery.query_dht(dht, query).await?;
+    let Some(announce) = stream.next().await else {
+        eprintln!("no announce found");
+        std::process::exit(1);
+    };
     let dir_name = format!(".swarmie-get-{}", content.hash.to_hex());
     let iroh_data_dir = std::env::current_dir()?.join(dir_name);
-    let db = iroh_bytes::store::flat::Store::load(&iroh_data_dir).await?;
+    let db = iroh_bytes::store::fs::Store::load(&iroh_data_dir).await?;
     let mp = MultiProgress::new();
     let connect_progress = mp.add(ProgressBar::hidden());
     connect_progress.set_draw_target(ProgressDrawTarget::stderr());
     connect_progress.set_style(ProgressStyle::default_spinner());
-    if args.tracker.is_empty() {
-        connect_progress.set_message(format!("connecting to mainline dht"));
-    } else {
-        connect_progress.set_message(format!("connecting to trackers"));
-    }
-    let q = Query {
-        content,
-        flags: QueryFlags {
-            complete: true,
-            verified: false,
-        },
-    };
-    let candidates = if args.tracker.is_empty() {
-        let dht = mainline::Dht::default();
-        let endpoint = create_quinn_client(
-            std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            vec![iroh_mainline_content_discovery::protocol::ALPN.to_vec()],
-            false,
-        )?;
-        query_dht(endpoint, dht, q, 1)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .filter_map(|x| match x {
-                Ok(x) => Some(x),
-                Err(cause) => {
-                    println!("tracker error: {:?}", cause);
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    } else {
-        query_trackers(endpoint.clone(), args.tracker, q, 2)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .filter_map(|x| match x {
-                Ok(x) => Some(x),
-                Err(cause) => {
-                    println!("tracker error: {:?}", cause);
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    };
-    println!("found {} candidates", candidates.len());
-    let candidate = candidates
-        .into_iter()
-        .next()
-        .context("no candidates found")?;
-    println!("trying announce {:?}", candidate);
+    connect_progress.set_message(format!("connecting to {}", announce.host));
     let connection = endpoint
-        .connect_by_node_id(&candidate.host, iroh_bytes::protocol::ALPN)
+        .connect_by_node_id(&announce.host, iroh_bytes::protocol::ALPN)
         .await?;
     connect_progress.finish_and_clear();
     let (send, recv) = flume::bounded(32);
     let progress = iroh_bytes::util::progress::FlumeProgressSender::new(send);
-    let (_hash_seq, sizes) = get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
-        .await
-        .map_err(show_get_error)?;
+    let (_hash_seq, sizes) =
+        get_hash_seq_and_sizes(&connection, &content.hash, 1024 * 1024 * 32)
+            .await
+            .map_err(show_get_error)?;
     let total_size = sizes.iter().sum::<u64>();
     let total_files = sizes.len().saturating_sub(1);
     let payload_size = sizes.iter().skip(1).sum::<u64>();
@@ -748,9 +709,10 @@ async fn receive(args: SubscribeArgs) -> anyhow::Result<()> {
         );
     }
     let _task = tokio::spawn(show_download_progress(recv.into_stream(), total_size));
-    let stats = iroh_bytes::get::db::get_to_db(&db, connection, &content, progress)
+    let get_conn = || async move { Ok(connection) };
+    let stats = iroh_bytes::get::db::get_to_db(&db, get_conn, &content, progress)
         .await
-        .map_err(show_get_error)?;
+        .map_err(|e| show_get_error(anyhow::anyhow!(e)))?;
     let collection = Collection::load(&db, &content.hash).await?;
     if args.common.verbose > 0 {
         for (name, hash) in collection.iter() {
@@ -795,8 +757,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let res = match args.command {
-        Commands::Publish(args) => publish(args).await,
-        Commands::Subscribe(args) => receive(args).await,
+        Commands::Send(args) => send(args).await,
+        Commands::Receive(args) => get(args).await,
     };
     match res {
         Ok(()) => std::process::exit(0),

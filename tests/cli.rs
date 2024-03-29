@@ -4,10 +4,10 @@ use std::{
     str::FromStr,
 };
 
-use iroh_net::ticket::BlobTicket;
+use iroh_base::ticket::BlobTicket;
 
 // binary path
-fn sendme_bin() -> &'static str {
+fn swarmie_bin() -> &'static str {
     env!("CARGO_BIN_EXE_swarmie")
 }
 
@@ -54,7 +54,7 @@ fn send_recv_file() {
     let src_file = src_dir.path().join(name);
     std::fs::write(&src_file, &data).unwrap();
     let mut send_cmd = duct::cmd(
-        sendme_bin(),
+        swarmie_bin(),
         ["send", src_file.as_os_str().to_str().unwrap()],
     )
     .dir(src_dir.path())
@@ -66,7 +66,7 @@ fn send_recv_file() {
     let output = String::from_utf8(output).unwrap();
     let ticket = output.split_ascii_whitespace().last().unwrap();
     let ticket = BlobTicket::from_str(ticket).unwrap();
-    let receive_output = duct::cmd(sendme_bin(), ["receive", &ticket.to_string()])
+    let receive_output = duct::cmd(swarmie_bin(), ["receive", &ticket.to_string()])
         .dir(tgt_dir.path())
         .env_remove("RUST_LOG") // disable tracing
         .stderr_to_stdout()
@@ -106,7 +106,7 @@ fn send_recv_dir() {
         }
     }
     let mut send_cmd = duct::cmd(
-        sendme_bin(),
+        swarmie_bin(),
         ["send", src_data_dir.as_os_str().to_str().unwrap()],
     )
     .dir(src_dir.path())
@@ -118,7 +118,7 @@ fn send_recv_dir() {
     let output = String::from_utf8(output).unwrap();
     let ticket = output.split_ascii_whitespace().last().unwrap();
     let ticket = BlobTicket::from_str(ticket).unwrap();
-    let receive_output = duct::cmd(sendme_bin(), ["receive", &ticket.to_string()])
+    let receive_output = duct::cmd(swarmie_bin(), ["receive", &ticket.to_string()])
         .dir(tgt_dir.path())
         .env_remove("RUST_LOG") // disable tracing
         .stderr_to_stdout()

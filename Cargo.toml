@@ -6,7 +6,7 @@ authors = ["Rüdiger Klaehn <rklaehn@protonmail.com>", "n0 team"]
 keywords = ["scp", "sftp", "network", "p2p", "holepunching"]
 categories = ["network-programming"]
 license = "Apache-2.0/MIT"
-repository = "https://github.com/n0-computer/dumb-pipe"
+repository = "https://github.com/n0-computer/swarmie"
 description = "A cli tool to send directories over the network, with NAT hole punching"
 
 
@@ -19,24 +19,25 @@ flume = "0.11.0"
 futures = "0.3.29"
 hex = "0.4.3"
 indicatif = "0.17.7"
-iroh-bytes = "0.12"
-iroh-io = "0.3.0"
-iroh-net = "0.12"
+iroh-base = "0.13"
+iroh-bytes = "0.13"
+iroh-io = "0.4.0"
+iroh-mainline-content-discovery = { path = "../iroh-examples/content-discovery/iroh-mainline-content-discovery" }
+iroh-net = "0.13"
+iroh-pkarr-node-discovery = "0.2.0"
+mainline = "1.4.0"
 num_cpus = "1.16.0"
+pkarr = "1.1.3"
 rand = "0.8.5"
 tokio = { version = "1.34.0", features = ["full"] }
 tokio-util = "0.7.10"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 walkdir = "2.4.0"
-iroh-mainline-content-discovery = { path = "../iroh-examples/content-discovery/iroh-mainline-content-discovery", features = ["client"], default-features = false }
-iroh-pkarr-node-discovery = "0.1.2"
-pkarr = "1.0.1"
-mainline = "1.0.0"
 
 [dev-dependencies]
 duct = "0.13.6"
-nix = { version = "0.27", features = ["signal", "process"] }
+nix = { version = "0.28", features = ["signal", "process"] }
 rand = "0.8.5"
 serde_json = "1.0.108"
 tempfile = "3.8.1"
